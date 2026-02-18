@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-gray-950 text-gray-100 font-sans antialiased;
+    background-image:
+      radial-gradient(
+        ellipse at 20% 50%,
+        rgba(37, 163, 110, 0.06) 0%,
+        transparent 50%
+      ),
+      radial-gradient(
+        ellipse at 80% 20%,
+        rgba(37, 163, 110, 0.04) 0%,
+        transparent 40%
+      );
+    min-height: 100vh;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-gray-900;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-600;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-gray-900/60 backdrop-blur-sm border border-gray-800/60 rounded-2xl;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-all duration-300 hover:border-brand-500/30 hover:bg-gray-900/80;
+  }
+
+  .btn-primary {
+    @apply bg-brand-500 hover:bg-brand-400 text-white font-semibold px-6 py-3 rounded-xl
+           transition-all duration-200 hover:shadow-lg hover:shadow-brand-500/25
+           active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-800 hover:bg-gray-700 text-gray-200 font-medium px-4 py-2 rounded-lg
+           border border-gray-700 hover:border-gray-600 transition-all duration-200;
+  }
+
+  .tag-positive {
+    @apply bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 text-xs font-medium px-2 py-0.5 rounded-full;
+  }
+
+  .tag-negative {
+    @apply bg-red-500/15 text-red-400 border border-red-500/30 text-xs font-medium px-2 py-0.5 rounded-full;
+  }
+
+  .tag-neutral {
+    @apply bg-gray-500/15 text-gray-400 border border-gray-500/30 text-xs font-medium px-2 py-0.5 rounded-full;
+  }
+
+  .metric-card {
+    @apply glass-card p-5 flex flex-col gap-1;
+  }
+
+  .log-line {
+    @apply font-mono text-xs text-gray-400 py-0.5 border-l-2 border-gray-800 pl-3;
+  }
+
+  .log-line.research {
+    @apply border-blue-500/60 text-blue-300;
+  }
+  .log-line.backtest {
+    @apply border-purple-500/60 text-purple-300;
+  }
+  .log-line.reflect {
+    @apply border-yellow-500/60 text-yellow-300;
+  }
+  .log-line.decide {
+    @apply border-brand-500/60 text-brand-300;
+  }
+  .log-line.error {
+    @apply border-red-500/60 text-red-300;
+  }
+  .log-line.status {
+    @apply border-gray-600 text-gray-400;
+  }
+}

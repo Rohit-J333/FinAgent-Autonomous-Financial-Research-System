@@ -1,0 +1,11 @@
+.env
+interview_guide.md
+.venv
+SETUP.md
+frontend/package.json
+frontend/package-lock.json
+frontend/node_modules
+frontend/dist
+strategy_engine/CMakeLists.txt
+strategy_engine/build
+__pycache__
