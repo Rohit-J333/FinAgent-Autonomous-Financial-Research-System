@@ -1,5 +1,6 @@
 .env
 interview_guide.md
+ARCHITECTURE.md
 .venv
 SETUP.md
 frontend/package.json

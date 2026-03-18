@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from agent.orchestrator import AgentState, agent
 from rag.retriever import FinancialRetriever
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
     try:
         vectordb = FinancialVectorDB(Config.QDRANT_URL)
         retriever = FinancialRetriever(vectordb)
-        logger.info("Indexing 10-K filings …")
+        logger.info("Indexing 10-K filings (real SEC EDGAR via edgartools) …")
         await vectordb.index_10k_filings(DEFAULT_SYMBOLS)
         logger.info("Vector DB ready.")
     except Exception as exc:
@@ -59,6 +60,24 @@ async def lifespan(app: FastAPI):
 
     logger.info("Shutting down FinAgent backend.")
 
+
+# ---------------------------------------------------------------------------
+# CORS (Fix 5)
+# ---------------------------------------------------------------------------
+
+_allowed_origins: list[str] = []
+
+# Always include local dev origins
+if Config.FRONTEND_URL:
+    _allowed_origins.append(Config.FRONTEND_URL)
+if "http://localhost:5173" not in _allowed_origins:
+    _allowed_origins.append("http://localhost:5173")
+if "http://localhost:3000" not in _allowed_origins:
+    _allowed_origins.append("http://localhost:3000")
+
+# Vercel preview / production deployments
+if Config.VERCEL_URL:
+    _allowed_origins.append(f"https://{Config.VERCEL_URL}")
 
 # ---------------------------------------------------------------------------
 # App
@@ -73,19 +92,40 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Request / Response models (Fix 4 — server-side symbol validation)
 # ---------------------------------------------------------------------------
+
+_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
 
 
 class AnalyzeRequest(BaseModel):
-    symbols: List[str] = ["AAPL", "MSFT"]
+    symbols: List[str] = Field(default=["AAPL", "MSFT"], max_length=6)
+
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("At least one symbol is required")
+        if len(v) > 6:
+            raise ValueError("Maximum 6 symbols per request")
+
+        cleaned: list[str] = []
+        for raw in v:
+            s = raw.strip().upper()
+            if not _SYMBOL_RE.match(s):
+                raise ValueError(
+                    f"Invalid symbol: '{raw}'. "
+                    "Symbols must be 1-5 uppercase letters (e.g. AAPL, MSFT)."
+                )
+            cleaned.append(s)
+        return cleaned
 
 
 class AnalyzeResponse(BaseModel):
@@ -98,6 +138,43 @@ class AnalyzeResponse(BaseModel):
     reflection: str
     steps: int
     timestamp: str
+    structured_decisions: list[dict] = []
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _initial_state(symbols: List[str]) -> AgentState:
+    """Build a clean AgentState for a new analysis run."""
+    return {
+        "messages": [],
+        "symbols": symbols,
+        "market_data": {},
+        "sentiment_scores": {},
+        "backtest_results": {},
+        "fundamentals": {},
+        "decision": "",
+        "confidence": 0.0,
+        "reflection": "",
+        "step": 0,
+        "reflection_step_count": 0,
+        "structured_decisions": [],
+    }
+
+
+def _serialize(obj):
+    """Make an object JSON-serializable."""
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_serialize(i) for i in obj]
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
 
 
 # ---------------------------------------------------------------------------
@@ -114,22 +191,9 @@ async def analyze_markets(request: AnalyzeRequest):
     symbols = request.symbols
     logger.info(f"Starting analysis for {symbols}")
 
-    initial_state: AgentState = {
-        "messages": [],
-        "symbols": symbols,
-        "market_data": {},
-        "sentiment_scores": {},
-        "backtest_results": {},
-        "fundamentals": {},
-        "decision": "",
-        "confidence": 0.0,
-        "reflection": "",
-        "step": 0,
-    }
-
     try:
         final_state = await agent.ainvoke(
-            initial_state, {"recursion_limit": Config.MAX_AGENT_STEPS}
+            _initial_state(symbols), {"recursion_limit": Config.MAX_AGENT_STEPS}
         )
 
         return AnalyzeResponse(
@@ -142,6 +206,7 @@ async def analyze_markets(request: AnalyzeRequest):
             reflection=final_state["reflection"],
             steps=final_state["step"],
             timestamp=datetime.utcnow().isoformat(),
+            structured_decisions=final_state.get("structured_decisions", []),
         )
 
     except Exception as exc:
@@ -165,25 +230,12 @@ async def websocket_analysis(websocket: WebSocket):
             data = await websocket.receive_json()
             symbols = data.get("symbols", ["AAPL"])
 
-            initial_state: AgentState = {
-                "messages": [],
-                "symbols": symbols,
-                "market_data": {},
-                "sentiment_scores": {},
-                "backtest_results": {},
-                "fundamentals": {},
-                "decision": "",
-                "confidence": 0.0,
-                "reflection": "",
-                "step": 0,
-            }
-
             await websocket.send_json(
                 {"type": "status", "message": f"Starting analysis for {symbols} …"}
             )
 
             try:
-                async for chunk in agent.astream(initial_state):
+                async for chunk in agent.astream(_initial_state(symbols)):
                     node_name = list(chunk.keys())[0]
                     node_output = chunk[node_name]
 
@@ -233,21 +285,3 @@ async def health_check():
         "vectordb": "connected" if vectordb else "unavailable",
         "timestamp": datetime.utcnow().isoformat(),
     }
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _serialize(obj):
-    """Make an object JSON-serializable."""
-    if isinstance(obj, dict):
-        return {k: _serialize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_serialize(i) for i in obj]
-    try:
-        json.dumps(obj)
-        return obj
-    except (TypeError, ValueError):
-        return str(obj)

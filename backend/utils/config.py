@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,3 +35,7 @@ class Config:
 
     # Backtester binary path
     BACKTESTER_BIN: str = os.getenv("BACKTESTER_BIN", "./strategy_engine/bin/backtest")
+
+    # CORS (Fix 5)
+    FRONTEND_URL: Optional[str] = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    VERCEL_URL: Optional[str] = os.getenv("VERCEL_URL")
