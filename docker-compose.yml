@@ -25,6 +25,14 @@ services:
       - ALPHA_VANTAGE_KEY=${ALPHA_VANTAGE_KEY}
       - QDRANT_URL=http://qdrant:6333
       - BACKTESTER_BIN=/app/strategy_engine/bin/backtest
+      - UPSTASH_REDIS_URL=${UPSTASH_REDIS_URL}
+      - USE_MCP=${USE_MCP:-true}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - OBSERVABILITY_ENABLED=${OBSERVABILITY_ENABLED:-true}
+      - CONFIDENCE_THRESHOLD=${CONFIDENCE_THRESHOLD:-0.6}
+      - REFLECTION_THRESHOLD=${REFLECTION_THRESHOLD:-2}
     volumes:
       - ./strategy_engine:/app/strategy_engine:ro
     depends_on:

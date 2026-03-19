@@ -26,8 +26,10 @@ class Config:
 
     # Agent Settings
     MAX_AGENT_STEPS: int = int(os.getenv("MAX_AGENT_STEPS", "10"))
-    REFLECTION_THRESHOLD: float = float(os.getenv("REFLECTION_THRESHOLD", "0.7"))
-    CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.7"))
+
+    # Fix 9: thresholds now wired into routing logic
+    CONFIDENCE_THRESHOLD: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
+    REFLECTION_THRESHOLD: int = int(os.getenv("REFLECTION_THRESHOLD", "2"))
 
     # Embedding model
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -39,3 +41,15 @@ class Config:
     # CORS (Fix 5)
     FRONTEND_URL: Optional[str] = os.getenv("FRONTEND_URL", "http://localhost:5173")
     VERCEL_URL: Optional[str] = os.getenv("VERCEL_URL")
+
+    # Redis / Upstash (Fix 6)
+    UPSTASH_REDIS_URL: Optional[str] = os.getenv("UPSTASH_REDIS_URL")
+
+    # MCP (Fix 8)
+    USE_MCP: bool = os.getenv("USE_MCP", "true").lower() in ("true", "1", "yes")
+
+    # Langfuse observability (Fix 10)
+    LANGFUSE_PUBLIC_KEY: Optional[str] = os.getenv("LANGFUSE_PUBLIC_KEY")
+    LANGFUSE_SECRET_KEY: Optional[str] = os.getenv("LANGFUSE_SECRET_KEY")
+    LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    OBSERVABILITY_ENABLED: bool = os.getenv("OBSERVABILITY_ENABLED", "true").lower() in ("true", "1", "yes")

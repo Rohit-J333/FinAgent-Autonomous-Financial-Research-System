@@ -1,139 +1,128 @@
 """
-MCP-style Strategy Server.
+MCP Strategy Server for FinAgent.
 
-Wraps the C++ backtest engine (or Python mock) and exposes it as an
-MCP-compatible tool that the LangGraph agent can call.
+Exposes two tools via the Model Context Protocol:
+  1. run_momentum_backtest – execute a momentum backtest for a symbol
+  2. get_technical_signals  – compute SMA/momentum indicators from price data
+
+Runnable standalone: python -m agent.mcp_servers.strategy_server
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import subprocess
-import tempfile
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
-BACKTESTER_BIN = os.getenv("BACKTESTER_BIN", "./strategy_engine/bin/backtest")
+
+# ---------------------------------------------------------------------------
+# Core tool functions (usable directly OR via FastMCP)
+# ---------------------------------------------------------------------------
 
 
+async def run_momentum_backtest(symbol: str, lookback_days: int = 90) -> Dict:
+    """
+    Run a momentum backtest for *symbol* using the C++ binary or mock fallback.
+    """
+    from agent.tools.backtest import execute_backtest
+
+    end_date = datetime.utcnow().strftime("%Y-%m-%d")
+    start_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime(
+        "%Y-%m-%d"
+    )
+    return await execute_backtest(
+        strategy="momentum",
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        params={"lookback_period": 20},
+    )
+
+
+async def get_technical_signals(symbol: str) -> Dict:
+    """
+    Compute basic technical signals from 3-month price data.
+
+    Returns {symbol, sma_20, sma_50, trend, momentum_pct, data_points}.
+    Falls back to error dict if insufficient data (< 50 points).
+    """
+    from agent.tools.backtest import get_price_data
+
+    prices = await get_price_data(symbol, period="3mo")
+
+    if len(prices) < 50:
+        return {"symbol": symbol, "error": "insufficient data"}
+
+    closes = [p["close"] for p in prices]
+
+    # 20-day SMA
+    sma_20 = sum(closes[-20:]) / 20
+    # 50-day SMA
+    sma_50 = sum(closes[-50:]) / 50
+
+    latest = closes[-1]
+
+    # Trend classification
+    if latest > sma_20 and latest > sma_50:
+        trend = "ABOVE_BOTH"
+    elif latest < sma_20 and latest < sma_50:
+        trend = "BELOW_BOTH"
+    else:
+        trend = "MIXED"
+
+    # Simple momentum: % change over 20 days
+    close_20_ago = closes[-21] if len(closes) > 20 else closes[0]
+    momentum_pct = ((latest / close_20_ago) - 1) * 100 if close_20_ago else 0
+
+    return {
+        "symbol": symbol,
+        "sma_20": round(sma_20, 2),
+        "sma_50": round(sma_50, 2),
+        "trend": trend,
+        "momentum_pct": round(momentum_pct, 2),
+        "data_points": len(prices),
+    }
+
+
+# ---------------------------------------------------------------------------
+# FastMCP server (standalone mode)
+# ---------------------------------------------------------------------------
+
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore
+
+    mcp = FastMCP("finagent-strategy-server")
+
+    @mcp.tool()
+    async def mcp_run_momentum_backtest(
+        symbol: str, lookback_days: int = 90
+    ) -> dict:
+        """Run a momentum backtest for a stock symbol."""
+        return await run_momentum_backtest(symbol, lookback_days)
+
+    @mcp.tool()
+    async def mcp_get_technical_signals(symbol: str) -> dict:
+        """Get SMA, trend, and momentum signals for a stock symbol."""
+        return await get_technical_signals(symbol)
+
+except ImportError:
+    mcp = None
+    logger.debug("mcp package not installed – FastMCP server unavailable.")
+
+
+# Legacy singleton for backward compatibility
 class StrategyMCPServer:
-    """
-    MCP-compatible strategy engine server.
-
-    Calls the C++ binary for deterministic backtesting.
-    Falls back to a Python mock when the binary is absent.
-    """
-
     name = "strategy-mcp-server"
-
-    async def backtest_strategy(
-        self,
-        strategy_name: str,
-        symbol: str,
-        start_date: str,
-        end_date: str,
-        params: Optional[Dict] = None,
-    ) -> Dict:
-        """
-        Execute a backtest and return performance metrics.
-
-        Args:
-            strategy_name: "momentum" | "mean_reversion" | "macd"
-            symbol:        Stock ticker
-            start_date:    YYYY-MM-DD
-            end_date:      YYYY-MM-DD
-            params:        Strategy-specific parameters
-
-        Returns:
-            {
-                "strategy": str,
-                "symbol": str,
-                "total_return": float,
-                "sharpe_ratio": float,
-                "max_drawdown": float,
-                "win_rate": float,
-                "total_trades": int,
-            }
-        """
-        params = params or {}
-
-        if not os.path.isfile(BACKTESTER_BIN):
-            logger.warning(
-                f"Binary not found at '{BACKTESTER_BIN}'. Using Python mock."
-            )
-            return self._mock_backtest(strategy_name, symbol, start_date, end_date)
-
-        backtest_input = {
-            "strategy": strategy_name,
-            "symbol": symbol,
-            "start_date": start_date,
-            "end_date": end_date,
-            "parameters": params,
-        }
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
-            json.dump(backtest_input, f)
-            input_file = f.name
-
-        output_file = input_file.replace(".json", "_output.json")
-
-        try:
-            result = subprocess.run(
-                [BACKTESTER_BIN, input_file, output_file],
-                timeout=30,
-                capture_output=True,
-            )
-
-            if result.returncode != 0:
-                err = result.stderr.decode()
-                logger.error(f"Backtester error: {err}")
-                return {"error": err}
-
-            with open(output_file, "r") as f:
-                results = json.load(f)
-
-            return {
-                "strategy": strategy_name,
-                "symbol": symbol,
-                "total_return": results.get("total_return", 0),
-                "sharpe_ratio": results.get("sharpe_ratio", 0),
-                "max_drawdown": results.get("max_drawdown", 0),
-                "win_rate": results.get("win_rate", 0),
-                "total_trades": results.get("total_trades", 0),
-            }
-
-        except subprocess.TimeoutExpired:
-            logger.error("Backtester timed out.")
-            return {"error": "timeout"}
-        finally:
-            for path in [input_file, output_file]:
-                if os.path.exists(path):
-                    os.remove(path)
-
-    @staticmethod
-    def _mock_backtest(
-        strategy_name: str, symbol: str, start_date: str, end_date: str
-    ) -> Dict:
-        presets = {
-            "momentum":       {"total_return": 0.23, "sharpe_ratio": 1.42, "max_drawdown": -0.08, "win_rate": 0.61, "total_trades": 48},
-            "mean_reversion": {"total_return": 0.15, "sharpe_ratio": 1.10, "max_drawdown": -0.06, "win_rate": 0.57, "total_trades": 72},
-            "macd":           {"total_return": 0.19, "sharpe_ratio": 1.25, "max_drawdown": -0.10, "win_rate": 0.55, "total_trades": 35},
-        }
-        base = presets.get(strategy_name, presets["momentum"])
-        return {
-            "strategy": strategy_name,
-            "symbol": symbol,
-            "start_date": start_date,
-            "end_date": end_date,
-            **base,
-            "mock": True,
-        }
+    backtest_strategy = staticmethod(run_momentum_backtest)
+    get_signals = staticmethod(get_technical_signals)
 
 
-# Singleton
 strategy_server = StrategyMCPServer()
+
+if __name__ == "__main__":
+    if mcp is not None:
+        mcp.run(transport="stdio")
+    else:
+        print("mcp package not installed. pip install mcp")

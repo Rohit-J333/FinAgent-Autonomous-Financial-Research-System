@@ -10,3 +10,4 @@ frontend/dist
 strategy_engine/CMakeLists.txt
 strategy_engine/build
 __pycache__
+*.md

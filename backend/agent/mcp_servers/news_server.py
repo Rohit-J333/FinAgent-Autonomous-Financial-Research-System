@@ -1,9 +1,11 @@
 """
-MCP-style News Server.
+MCP News Server for FinAgent.
 
-Exposes a `scrape_market_news` tool that the LangGraph agent can call
-via the MCP protocol. This module also works as a standalone FastAPI
-sub-application for testing.
+Exposes two tools via the Model Context Protocol:
+  1. get_financial_news   – fetch & return recent articles from NewsAPI
+  2. get_market_sentiment_summary – quick headline-based sentiment snapshot
+
+Runnable standalone: python -m agent.mcp_servers.news_server
 """
 
 from __future__ import annotations
@@ -11,140 +13,152 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List
 
 import httpx
-
-from agent.tools.sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
 
 NEWS_API_BASE = "https://newsapi.org/v2/everything"
 
+# Keyword lists for lightweight headline sentiment (no model needed)
+_BULLISH = {
+    "surge", "gain", "rise", "rally", "beat", "profit", "growth", "bullish",
+    "upgrade", "outperform", "record", "strong", "soar", "boom", "jump",
+}
+_BEARISH = {
+    "drop", "fall", "loss", "decline", "miss", "bearish", "downgrade",
+    "underperform", "weak", "crash", "plunge", "warning", "slump", "sink",
+}
 
+
+# ---------------------------------------------------------------------------
+# Core tool functions (usable directly OR via FastMCP)
+# ---------------------------------------------------------------------------
+
+
+async def get_financial_news(symbol: str, limit: int = 10) -> List[Dict]:
+    """
+    Fetch recent financial news articles for *symbol* from NewsAPI.
+
+    Returns list of {title, description, publishedAt, source} dicts.
+    Falls back to empty list if API key missing or request fails.
+    """
+    api_key = os.getenv("NEWS_API_KEY", "")
+    if not api_key:
+        logger.warning("NEWS_API_KEY not set – returning empty news list.")
+        return []
+
+    params = {
+        "q": f"{symbol} stock earnings",
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": min(limit, 100),
+        "apiKey": api_key,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(NEWS_API_BASE, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.error(f"NewsAPI request failed for {symbol}: {exc}")
+        return []
+
+    articles = data.get("articles", [])
+    return [
+        {
+            "title": a.get("title", ""),
+            "description": a.get("description", ""),
+            "publishedAt": a.get("publishedAt", ""),
+            "source": a.get("source", {}).get("name", "Unknown"),
+        }
+        for a in articles[:limit]
+    ]
+
+
+async def get_market_sentiment_summary(symbol: str) -> Dict:
+    """
+    Quick headline-based sentiment snapshot for *symbol*.
+
+    Fetches the 5 most recent articles and classifies sentiment using
+    keyword matching (no ML model needed).
+
+    Returns {symbol, article_count, avg_sentiment_hint, latest_headline}.
+    """
+    articles = await get_financial_news(symbol, limit=5)
+
+    if not articles:
+        return {
+            "symbol": symbol,
+            "article_count": 0,
+            "avg_sentiment_hint": "neutral",
+            "latest_headline": "",
+        }
+
+    bullish_count = 0
+    bearish_count = 0
+
+    for a in articles:
+        text = (a.get("title", "") + " " + a.get("description", "")).lower()
+        b = sum(1 for w in _BULLISH if w in text)
+        s = sum(1 for w in _BEARISH if w in text)
+        if b > s:
+            bullish_count += 1
+        elif s > b:
+            bearish_count += 1
+
+    if bullish_count > bearish_count:
+        hint = "positive"
+    elif bearish_count > bullish_count:
+        hint = "negative"
+    else:
+        hint = "neutral"
+
+    return {
+        "symbol": symbol,
+        "article_count": len(articles),
+        "avg_sentiment_hint": hint,
+        "latest_headline": articles[0].get("title", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# FastMCP server (standalone mode)
+# ---------------------------------------------------------------------------
+
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore
+
+    mcp = FastMCP("finagent-news-server")
+
+    @mcp.tool()
+    async def mcp_get_financial_news(symbol: str, limit: int = 10) -> list[dict]:
+        """Fetch recent financial news for a stock symbol."""
+        return await get_financial_news(symbol, limit)
+
+    @mcp.tool()
+    async def mcp_get_market_sentiment(symbol: str) -> dict:
+        """Get a quick headline-based sentiment summary for a stock symbol."""
+        return await get_market_sentiment_summary(symbol)
+
+except ImportError:
+    mcp = None
+    logger.debug("mcp package not installed – FastMCP server unavailable.")
+
+
+# Legacy singleton for backward compatibility
 class NewsMCPServer:
-    """
-    Lightweight MCP-compatible news server.
-
-    In a full MCP deployment this would be launched as a separate process
-    and communicate over stdio/SSE. Here we expose the core logic as
-    async methods that the orchestrator can call directly.
-    """
-
     name = "news-mcp-server"
-
-    async def scrape_market_news(
-        self,
-        symbol: str,
-        sentiment_filter: Optional[str] = None,
-        page_size: int = 50,
-    ) -> dict:
-        """
-        Fetch financial news for *symbol* and enrich with sentiment scores.
-
-        Args:
-            symbol:           Stock ticker, e.g. "AAPL"
-            sentiment_filter: "positive" | "negative" | None (all)
-            page_size:        Articles to request from NewsAPI
-
-        Returns:
-            {
-                "symbol": str,
-                "total_articles": int,
-                "articles": [...],
-                "aggregate_sentiment": {...},
-                "timestamp": str
-            }
-        """
-        api_key = os.getenv("NEWS_API_KEY", "")
-        if not api_key:
-            logger.warning("NEWS_API_KEY not set – returning mock data.")
-            return self._mock_response(symbol)
-
-        params = {
-            "q": f"{symbol} stock market",
-            "sortBy": "publishedAt",
-            "language": "en",
-            "pageSize": page_size,
-            "apiKey": api_key,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(NEWS_API_BASE, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as exc:
-            logger.error(f"NewsAPI error: {exc}")
-            return self._mock_response(symbol)
-
-        articles = data.get("articles", [])
-        enriched = []
-        aggregate = {"positive": 0, "negative": 0, "neutral": 0}
-
-        for article in articles:
-            text = article.get("description") or article.get("title") or ""
-            sentiment = analyze_sentiment(text)
-            label = sentiment["label"]
-
-            if sentiment_filter and label != sentiment_filter:
-                continue
-
-            aggregate[label] = aggregate.get(label, 0) + 1
-            enriched.append(
-                {
-                    "title": article.get("title", ""),
-                    "source": article.get("source", {}).get("name", "Unknown"),
-                    "published_at": article.get("publishedAt", ""),
-                    "url": article.get("url", ""),
-                    "sentiment": label,
-                    "confidence": sentiment["score"],
-                }
-            )
-
-        return {
-            "symbol": symbol,
-            "total_articles": len(enriched),
-            "articles": enriched[:20],
-            "aggregate_sentiment": aggregate,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-    @staticmethod
-    def _mock_response(symbol: str) -> dict:
-        return {
-            "symbol": symbol,
-            "total_articles": 3,
-            "articles": [
-                {
-                    "title": f"{symbol} beats earnings expectations",
-                    "source": "Reuters",
-                    "published_at": datetime.utcnow().isoformat(),
-                    "url": "",
-                    "sentiment": "positive",
-                    "confidence": 0.91,
-                },
-                {
-                    "title": f"Analysts raise {symbol} price target",
-                    "source": "Bloomberg",
-                    "published_at": datetime.utcnow().isoformat(),
-                    "url": "",
-                    "sentiment": "positive",
-                    "confidence": 0.87,
-                },
-                {
-                    "title": f"Macro headwinds could pressure {symbol}",
-                    "source": "CNBC",
-                    "published_at": datetime.utcnow().isoformat(),
-                    "url": "",
-                    "sentiment": "negative",
-                    "confidence": 0.72,
-                },
-            ],
-            "aggregate_sentiment": {"positive": 2, "negative": 1, "neutral": 0},
-            "timestamp": datetime.utcnow().isoformat(),
-        }
+    scrape_market_news = staticmethod(get_financial_news)
+    get_sentiment_summary = staticmethod(get_market_sentiment_summary)
 
 
-# Singleton
 news_server = NewsMCPServer()
+
+if __name__ == "__main__":
+    if mcp is not None:
+        mcp.run(transport="stdio")
+    else:
+        print("mcp package not installed. pip install mcp")

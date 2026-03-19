@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
@@ -26,6 +28,7 @@ from agent.orchestrator import AgentState, agent
 from rag.retriever import FinancialRetriever
 from rag.vectordb import FinancialVectorDB
 from utils.config import Config
+from utils.observability import get_langfuse_handler, log_analysis_result
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,7 +70,6 @@ async def lifespan(app: FastAPI):
 
 _allowed_origins: list[str] = []
 
-# Always include local dev origins
 if Config.FRONTEND_URL:
     _allowed_origins.append(Config.FRONTEND_URL)
 if "http://localhost:5173" not in _allowed_origins:
@@ -75,7 +77,6 @@ if "http://localhost:5173" not in _allowed_origins:
 if "http://localhost:3000" not in _allowed_origins:
     _allowed_origins.append("http://localhost:3000")
 
-# Vercel preview / production deployments
 if Config.VERCEL_URL:
     _allowed_origins.append(f"https://{Config.VERCEL_URL}")
 
@@ -139,6 +140,7 @@ class AnalyzeResponse(BaseModel):
     steps: int
     timestamp: str
     structured_decisions: list[dict] = []
+    latency_ms: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,7 @@ def _initial_state(symbols: List[str]) -> AgentState:
         "step": 0,
         "reflection_step_count": 0,
         "structured_decisions": [],
+        "routing_reason": "",
     }
 
 
@@ -189,14 +192,27 @@ async def analyze_markets(request: AnalyzeRequest):
     research → backtest → reflect → decide
     """
     symbols = request.symbols
-    logger.info(f"Starting analysis for {symbols}")
+    session_id = str(uuid.uuid4())
+    logger.info(f"Starting analysis for {symbols} (session={session_id})")
+
+    # --- Langfuse handler (Fix 10) ---
+    handler = get_langfuse_handler(
+        user_id="api",
+        session_id=session_id,
+        metadata={"symbols": symbols},
+    )
+    invoke_config: dict = {"recursion_limit": Config.MAX_AGENT_STEPS}
+    if handler:
+        invoke_config["callbacks"] = [handler]
 
     try:
-        final_state = await agent.ainvoke(
-            _initial_state(symbols), {"recursion_limit": Config.MAX_AGENT_STEPS}
-        )
+        t0 = time.perf_counter()
+        final_state = await agent.ainvoke(_initial_state(symbols), invoke_config)
+        latency_ms = (time.perf_counter() - t0) * 1000
 
-        return AnalyzeResponse(
+        logger.info(f"Analysis complete in {latency_ms:.0f}ms for {symbols}")
+
+        response = AnalyzeResponse(
             status="success",
             symbols=symbols,
             decision=final_state["decision"],
@@ -207,7 +223,18 @@ async def analyze_markets(request: AnalyzeRequest):
             steps=final_state["step"],
             timestamp=datetime.utcnow().isoformat(),
             structured_decisions=final_state.get("structured_decisions", []),
+            latency_ms=round(latency_ms, 1),
         )
+
+        # Log to Langfuse (non-blocking, never crashes)
+        log_analysis_result(
+            symbols=symbols,
+            result=response.model_dump(),
+            latency_ms=latency_ms,
+            session_id=session_id,
+        )
+
+        return response
 
     except Exception as exc:
         logger.error(f"Analysis failed: {exc}", exc_info=True)
@@ -229,13 +256,27 @@ async def websocket_analysis(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             symbols = data.get("symbols", ["AAPL"])
+            session_id = str(uuid.uuid4())
+
+            # --- Langfuse handler (Fix 10) ---
+            handler = get_langfuse_handler(
+                user_id="ws",
+                session_id=session_id,
+                metadata={"symbols": symbols, "transport": "websocket"},
+            )
+            stream_config: dict = {"recursion_limit": Config.MAX_AGENT_STEPS}
+            if handler:
+                stream_config["callbacks"] = [handler]
 
             await websocket.send_json(
                 {"type": "status", "message": f"Starting analysis for {symbols} …"}
             )
 
             try:
-                async for chunk in agent.astream(_initial_state(symbols)):
+                t0 = time.perf_counter()
+                async for chunk in agent.astream(
+                    _initial_state(symbols), stream_config
+                ):
                     node_name = list(chunk.keys())[0]
                     node_output = chunk[node_name]
 
@@ -249,7 +290,14 @@ async def websocket_analysis(websocket: WebSocket):
                     )
                     await asyncio.sleep(0.05)
 
-                await websocket.send_json({"type": "complete", "status": "success"})
+                latency_ms = (time.perf_counter() - t0) * 1000
+                await websocket.send_json(
+                    {
+                        "type": "complete",
+                        "status": "success",
+                        "latency_ms": round(latency_ms, 1),
+                    }
+                )
 
             except Exception as exc:
                 await websocket.send_json({"type": "error", "message": str(exc)})
