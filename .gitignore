@@ -3,6 +3,12 @@ interview_guide.md
 ARCHITECTURE.md
 .venv
 SETUP.md
+# uv — commit uv.lock, ignore the cache
+.uv-cache/
+# pytest
+.pytest_cache/
+__pycache__/
+*.pyc
 frontend/package.json
 frontend/package-lock.json
 frontend/node_modules

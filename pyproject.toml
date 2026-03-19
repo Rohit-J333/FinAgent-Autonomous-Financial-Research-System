@@ -1,0 +1,88 @@
+[project]
+name = "finagent"
+version = "1.0.0"
+description = "Autonomous financial research system — LangGraph + FastAPI + Gemini"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "langgraph>=0.1.0",
+    "langchain-google-genai>=1.0.0",
+    "langchain-core>=0.2.0",
+    "google-generativeai>=0.7.0",
+    "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
+    "transformers>=4.40.0",
+    "torch>=2.2.0",
+    "qdrant-client>=1.9.0",
+    "sentence-transformers>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "websockets>=12.0",
+    "pydantic>=2.7.0",
+    "edgartools>=5.23",
+    "yfinance>=0.2.36",
+    "redis>=5.0.0",
+    "upstash-redis>=1.0.0",
+    "langchain-mcp-adapters>=0.1.8",
+    "mcp>=1.0.0",
+    "langfuse>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+# uv resolves the lock file from this table
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+[tool.uv.sources]
+# Pin torch to CPU-only build to keep the image small.
+# Remove this block if you have a GPU and want CUDA support.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --show-capture=log"
+log_cli = true
+log_cli_level = "INFO"
+log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+# ---------------------------------------------------------------------------
+# ruff (optional linter — uv can run it via `uv run ruff check .`)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

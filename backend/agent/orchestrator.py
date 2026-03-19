@@ -420,12 +420,28 @@ the agent loops back for more research (threshold: {Config.CONFIDENCE_THRESHOLD}
         reflection_text = (
             "Reflection unavailable. Proceeding with available data. PROCEED"
         )
-        confidence = 0.5
+        # Set above CONFIDENCE_THRESHOLD so the routing function proceeds
+        # to decide immediately — don't waste cycles looping with no LLM.
+        confidence = 0.7
+
+    # Pre-compute why routing will fire so it ends up in state
+    reflection_count_new = reflection_count + 1
+    if reflection_count_new >= Config.REFLECTION_THRESHOLD:
+        routing_reason = f"Hard cap reached ({reflection_count_new}/{Config.REFLECTION_THRESHOLD}). Forcing decide."
+    elif "GATHER_MORE_DATA" in reflection_text:
+        routing_reason = f"LLM requested GATHER_MORE_DATA (loop {reflection_count_new}/{Config.REFLECTION_THRESHOLD})."
+    elif confidence < Config.CONFIDENCE_THRESHOLD:
+        routing_reason = f"Confidence {confidence:.2f} < threshold {Config.CONFIDENCE_THRESHOLD}. Looping back."
+    else:
+        routing_reason = f"Confidence {confidence:.2f} >= threshold {Config.CONFIDENCE_THRESHOLD}. Proceeding to decide."
+
+    logger.info(f"[reflection_node] routing_reason: {routing_reason}")
 
     return {
         "reflection": reflection_text,
         "confidence": round(confidence, 3),
-        "reflection_step_count": reflection_count + 1,
+        "reflection_step_count": reflection_count_new,
+        "routing_reason": routing_reason,
         "step": state.get("step", 0) + 1,
     }
 
