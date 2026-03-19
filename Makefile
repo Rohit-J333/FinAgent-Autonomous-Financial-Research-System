@@ -33,12 +33,12 @@ help:
 
 # First-time setup: creates .venv and installs everything including dev extras
 install:
-	uv sync --extra dev
+	uv sync --group dev
 	cd frontend && npm install
 
 # Re-sync without touching the lock file (safe for CI)
 sync:
-	uv sync --extra dev
+	uv sync --group dev
 
 # Rebuild uv.lock from scratch (run after editing pyproject.toml)
 lock:
@@ -95,7 +95,7 @@ docker-test:
 
 # ── local dev ────────────────────────────────────────────────────────────────
 backend:
-	cd backend && uv run uvicorn main:app --reload --port 8000
+	uv run --directory backend uvicorn main:app --reload --port 8000
 
 frontend:
 	cd frontend && npm run dev

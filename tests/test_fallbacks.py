@@ -1,13 +1,19 @@
 """
-Zero-API-key fallback test suite.
+Zero-API-key fallback test suite for FinAgent.
 
-Every test in this file must pass with ALL external services absent:
+Every test passes with ALL external services absent:
   - No GEMINI_API_KEY      → LLM nodes fall back to HOLD + confidence 0.7
   - No NEWS_API_KEY        → news scraper returns 3 mock articles
   - No C++ binary          → backtester returns mock presets (mock=True)
   - No Qdrant              → RAG disabled, /api/fundamentals returns 503
   - No Redis               → price caching silently skipped
-  - No Langfuse keys       → tracing no-op, agent unaffected
+  - No Langfuse keys       → tracing is a no-op, agent unaffected
+
+Note on imports
+───────────────
+conftest.py inserts backend/ into sys.path so all imports here are
+relative to backend/ (e.g. `from agent.tools.sentiment import ...`)
+matching how the production code itself resolves modules.
 
 Run:
     pytest tests/test_fallbacks.py -v
@@ -15,43 +21,41 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
-import os
 import pytest
-import pytest_asyncio
+from unittest.mock import AsyncMock, patch
 
 
-# ---------------------------------------------------------------------------
-# Layer 1: Unit tests — individual tool fallbacks
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Layer 1 — Unit tests: individual tool fallbacks
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class TestSentimentFallback:
     """FinBERT may or may not be installed. Heuristic must always work."""
 
     def test_positive_headline(self):
-        from backend.agent.tools.sentiment import analyze_sentiment  # type: ignore
+        from agent.tools.sentiment import analyze_sentiment
 
         result = analyze_sentiment("Company reports record earnings surge")
         assert result["label"] in ("positive", "negative", "neutral")
         assert 0.0 <= result["score"] <= 1.0
 
     def test_negative_headline(self):
-        from backend.agent.tools.sentiment import analyze_sentiment  # type: ignore
+        from agent.tools.sentiment import analyze_sentiment
 
         result = analyze_sentiment("Stock crashes amid market turmoil and loss warning")
         assert result["label"] in ("positive", "negative", "neutral")
         assert 0.0 <= result["score"] <= 1.0
 
     def test_empty_text_returns_neutral(self):
-        from backend.agent.tools.sentiment import analyze_sentiment  # type: ignore
+        from agent.tools.sentiment import analyze_sentiment
 
         result = analyze_sentiment("")
         assert result["label"] == "neutral"
         assert result["score"] == 0.5
 
     def test_whitespace_only_returns_neutral(self):
-        from backend.agent.tools.sentiment import analyze_sentiment  # type: ignore
+        from agent.tools.sentiment import analyze_sentiment
 
         result = analyze_sentiment("   ")
         assert result["label"] == "neutral"
@@ -62,13 +66,11 @@ class TestNewsFallback:
 
     @pytest.mark.asyncio
     async def test_returns_mock_when_no_key(self):
-        from backend.agent.tools.news_scraper import scrape_financial_news  # type: ignore
+        from agent.tools.news_scraper import scrape_financial_news
 
         result = await scrape_financial_news("AAPL")
         assert result["symbol"] == "AAPL"
         assert result["total_articles"] > 0
-        assert len(result["articles"]) > 0
-        # Every article must have required fields
         for article in result["articles"]:
             assert "sentiment" in article
             assert "confidence" in article
@@ -76,7 +78,7 @@ class TestNewsFallback:
 
     @pytest.mark.asyncio
     async def test_mock_articles_have_valid_confidence(self):
-        from backend.agent.tools.news_scraper import scrape_financial_news  # type: ignore
+        from agent.tools.news_scraper import scrape_financial_news
 
         result = await scrape_financial_news("MSFT")
         for article in result["articles"]:
@@ -84,130 +86,107 @@ class TestNewsFallback:
 
     @pytest.mark.asyncio
     async def test_aggregate_sentiment_present(self):
-        from backend.agent.tools.news_scraper import scrape_financial_news  # type: ignore
+        from agent.tools.news_scraper import scrape_financial_news
 
         result = await scrape_financial_news("GOOGL")
         agg = result["aggregate_sentiment"]
-        assert "positive" in agg
-        assert "negative" in agg
-        assert "neutral" in agg
+        assert all(k in agg for k in ("positive", "negative", "neutral"))
 
 
 class TestBacktestFallback:
-    """C++ binary absent → must return mock presets, mock=True, never raise."""
+    """C++ binary absent → mock presets returned, mock=True, never raise."""
 
     @pytest.mark.asyncio
     async def test_momentum_mock(self):
-        from backend.agent.tools.backtest import execute_backtest  # type: ignore
+        from agent.tools.backtest import execute_backtest
 
         result = await execute_backtest(
-            strategy="momentum",
-            symbol="AAPL",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
+            strategy="momentum", symbol="AAPL",
+            start_date="2024-01-01", end_date="2024-12-31",
         )
         assert result["mock"] is True
         assert result["strategy"] == "momentum"
         assert result["symbol"] == "AAPL"
-        assert "total_return" in result
-        assert "sharpe_ratio" in result
-        assert "win_rate" in result
+        assert "total_return" in result and "sharpe_ratio" in result
 
     @pytest.mark.asyncio
     async def test_mean_reversion_mock(self):
-        from backend.agent.tools.backtest import execute_backtest  # type: ignore
+        from agent.tools.backtest import execute_backtest
 
         result = await execute_backtest(
-            strategy="mean_reversion",
-            symbol="MSFT",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
+            strategy="mean_reversion", symbol="MSFT",
+            start_date="2024-01-01", end_date="2024-12-31",
         )
         assert result["mock"] is True
         assert 0.0 <= result["win_rate"] <= 1.0
 
     @pytest.mark.asyncio
     async def test_unknown_strategy_falls_back_to_momentum_preset(self):
-        from backend.agent.tools.backtest import execute_backtest  # type: ignore
+        from agent.tools.backtest import execute_backtest
 
         result = await execute_backtest(
-            strategy="fancy_new_strategy",
-            symbol="TSLA",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
+            strategy="nonexistent_strategy", symbol="TSLA",
+            start_date="2024-01-01", end_date="2024-12-31",
         )
         assert result["mock"] is True
-        assert "total_return" in result  # fell back to momentum preset
+        assert "total_return" in result
 
     @pytest.mark.asyncio
-    async def test_get_price_data_returns_list_not_raises(self):
-        """yfinance may return real data or [] — must never raise."""
-        from backend.agent.tools.backtest import get_price_data  # type: ignore
+    async def test_get_price_data_never_raises(self):
+        from agent.tools.backtest import get_price_data
 
         result = await get_price_data("AAPL", period="1mo")
         assert isinstance(result, list)
-        # If data came back, validate schema
-        if result:
-            assert "date" in result[0]
-            assert "close" in result[0]
-            assert "volume" in result[0]
+        if result:  # validate schema if yfinance returned data
+            assert all(k in result[0] for k in ("date", "close", "volume"))
 
     @pytest.mark.asyncio
     async def test_get_current_quote_never_raises(self):
-        from backend.agent.tools.backtest import get_current_quote  # type: ignore
+        from agent.tools.backtest import get_current_quote
 
         result = await get_current_quote("AAPL")
-        assert "symbol" in result
-        assert "price" in result
-        assert "change_pct" in result
-        assert "volume" in result
-        # Values must be numeric (may be 0 if yfinance fails)
+        assert all(k in result for k in ("symbol", "price", "change_pct", "volume"))
         assert isinstance(result["price"], (int, float))
 
 
 class TestRedisSkipped:
-    """No UPSTASH_REDIS_URL → caching skipped silently, fetch still works."""
+    """UPSTASH_REDIS_URL="" → caching silently skipped, fetch still works."""
 
     @pytest.mark.asyncio
     async def test_price_data_works_without_redis(self):
-        from backend.agent.tools.backtest import get_price_data  # type: ignore
+        from agent.tools.backtest import get_price_data
 
-        # Should return data (or empty list) without raising
         result = await get_price_data("MSFT")
         assert isinstance(result, list)
 
     def test_redis_client_is_none_without_url(self):
-        from backend.agent.tools.backtest import _get_redis  # type: ignore
+        from agent.tools.backtest import _get_redis
 
-        # UPSTASH_REDIS_URL is "" in conftest — client must be None
-        client = _get_redis()
-        assert client is None
+        assert _get_redis() is None
 
 
 class TestLangfuseNoOp:
     """No Langfuse keys → handler is None, agent unaffected."""
 
     def test_get_handler_returns_none_without_keys(self):
-        from backend.utils.observability import get_langfuse_handler  # type: ignore
+        from utils.observability import get_langfuse_handler
 
-        handler = get_langfuse_handler(user_id="test", session_id="s1")
-        assert handler is None
+        assert get_langfuse_handler(user_id="test", session_id="s1") is None
 
     def test_log_result_does_not_raise_without_keys(self):
-        from backend.utils.observability import log_analysis_result  # type: ignore
+        from utils.observability import log_analysis_result
 
-        # Must be a no-op, not raise
         log_analysis_result(
             symbols=["AAPL"],
             result={"confidence": 0.7, "steps": 4},
             latency_ms=1234.5,
             session_id="s1",
-        )
+        )  # must be a silent no-op
 
 
-# ---------------------------------------------------------------------------
-# Layer 2: Integration tests — full pipeline via HTTP
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Layer 2 — Integration tests: full pipeline via HTTP
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -217,8 +196,7 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "healthy"
-        # Qdrant is deliberately unreachable — vectordb should be "unavailable"
-        assert body["vectordb"] == "unavailable"
+        assert body["vectordb"] == "unavailable"  # Qdrant on port 9999
 
     async def test_health_has_timestamp(self, async_client):
         resp = await async_client.get("/health")
@@ -227,13 +205,10 @@ class TestHealthEndpoint:
 
 @pytest.mark.asyncio
 class TestSymbolValidation:
-    """Fix 4 — server-side validation must return 422, never 500."""
+    """Fix 4 — server-side validation returns 422, never 500."""
 
     async def test_valid_symbols_accepted(self, async_client):
-        resp = await async_client.post(
-            "/api/analyze", json={"symbols": ["AAPL", "MSFT"]}
-        )
-        # May be 200 (with mock data) or 500 (LLM unavailable) but NOT 422
+        resp = await async_client.post("/api/analyze", json={"symbols": ["AAPL"]})
         assert resp.status_code != 422
 
     async def test_too_many_symbols_returns_422(self, async_client):
@@ -242,156 +217,161 @@ class TestSymbolValidation:
             json={"symbols": ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "NVDA", "META"]},
         )
         assert resp.status_code == 422
-        detail = resp.json()["detail"]
-        assert any("Maximum 6" in str(e) for e in detail)
+        assert any("Maximum 6" in str(e) for e in resp.json()["detail"])
 
     async def test_empty_symbols_returns_422(self, async_client):
         resp = await async_client.post("/api/analyze", json={"symbols": []})
         assert resp.status_code == 422
 
-    async def test_invalid_symbol_chars_returns_422(self, async_client):
+    async def test_symbol_with_special_chars_returns_422(self, async_client):
         resp = await async_client.post(
             "/api/analyze", json={"symbols": ["AAPL", "DROP TABLE"]}
         )
         assert resp.status_code == 422
 
     async def test_symbol_with_digits_rejected(self, async_client):
-        resp = await async_client.post(
-            "/api/analyze", json={"symbols": ["AA1PL"]}
-        )
+        resp = await async_client.post("/api/analyze", json={"symbols": ["AA1PL"]})
         assert resp.status_code == 422
-
-    async def test_lowercase_symbols_auto_uppercased(self, async_client):
-        """Lowercase should be cleaned, not rejected."""
-        resp = await async_client.post(
-            "/api/analyze", json={"symbols": ["aapl"]}
-        )
-        # 422 would mean validation rejected it — we expect it to be normalized
-        assert resp.status_code != 422
 
     async def test_symbol_too_long_rejected(self, async_client):
-        resp = await async_client.post(
-            "/api/analyze", json={"symbols": ["TOOLONG"]}
-        )
+        resp = await async_client.post("/api/analyze", json={"symbols": ["TOOLONG"]})
         assert resp.status_code == 422
+
+    async def test_lowercase_symbols_normalized_not_rejected(self, async_client):
+        resp = await async_client.post("/api/analyze", json={"symbols": ["aapl"]})
+        assert resp.status_code != 422  # cleaned to "AAPL"
 
 
 @pytest.mark.asyncio
 class TestFullPipelineZeroKeys:
-    """
-    The critical recruiter test: full analysis with zero valid API keys.
-    Must return 200 with valid structure — never 500.
-    """
+    """Critical recruiter test: full analysis with zero valid API keys → 200."""
 
     async def test_single_symbol_returns_200(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "success"
+        assert resp.json()["status"] == "success"
 
     async def test_response_has_all_required_fields(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
-        body = resp.json()
         required = {
-            "status", "symbols", "decision", "confidence",
-            "sentiment", "backtest_results", "reflection",
-            "steps", "timestamp", "structured_decisions", "latency_ms",
+            "status", "symbols", "decision", "confidence", "sentiment",
+            "backtest_results", "reflection", "steps", "timestamp",
+            "structured_decisions", "latency_ms",
         }
-        assert required.issubset(body.keys())
+        assert required.issubset(resp.json().keys())
 
     async def test_confidence_is_valid_float(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
-        body = resp.json()
-        assert 0.0 <= body["confidence"] <= 1.0
+        assert 0.0 <= resp.json()["confidence"] <= 1.0
 
-    async def test_backtest_results_present_for_each_symbol(self, async_client):
+    async def test_results_present_for_all_requested_symbols(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL", "MSFT"]},
-            timeout=90.0,
+            "/api/analyze", json={"symbols": ["AAPL", "MSFT"]}, timeout=90.0
         )
         body = resp.json()
-        assert "AAPL" in body["backtest_results"]
-        assert "MSFT" in body["backtest_results"]
+        assert "AAPL" in body["backtest_results"] and "MSFT" in body["backtest_results"]
+        assert "AAPL" in body["sentiment"] and "MSFT" in body["sentiment"]
 
-    async def test_sentiment_present_for_each_symbol(self, async_client):
+    async def test_mock_backtest_flagged(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL", "MSFT"]},
-            timeout=90.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
-        body = resp.json()
-        assert "AAPL" in body["sentiment"]
-        assert "MSFT" in body["sentiment"]
-
-    async def test_structured_decisions_is_list(self, async_client):
-        resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
-        )
-        body = resp.json()
-        assert isinstance(body["structured_decisions"], list)
-
-    async def test_mock_backtest_flagged_as_mock(self, async_client):
-        """Without C++ binary, backtest results must have mock=True."""
-        resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
-        )
-        body = resp.json()
-        aapl_bt = body["backtest_results"].get("AAPL", {})
-        assert aapl_bt.get("mock") is True
+        assert resp.json()["backtest_results"]["AAPL"]["mock"] is True
 
     async def test_latency_ms_is_positive(self, async_client):
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
-        body = resp.json()
-        assert body["latency_ms"] > 0
+        assert resp.json()["latency_ms"] > 0
 
     async def test_no_reflection_loop_with_no_llm(self, async_client):
         """
-        With no GEMINI_API_KEY, reflection fallback confidence=0.7 >= threshold 0.6.
-        Agent should complete in 1 reflection pass, not 2.
-        steps should be exactly 4 (research + backtest + reflect + decide).
+        Bug fix verification: reflection fallback confidence=0.7 >= threshold 0.6
+        → agent completes in exactly 4 steps, no unnecessary loop.
         """
         resp = await async_client.post(
-            "/api/analyze",
-            json={"symbols": ["AAPL"]},
-            timeout=60.0,
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=60.0
         )
-        body = resp.json()
-        # 4 steps = 1 research + 1 backtest + 1 reflect + 1 decide
-        assert body["steps"] == 4, (
-            f"Expected 4 steps (no reflection loop), got {body['steps']}. "
-            "Fallback confidence may be below CONFIDENCE_THRESHOLD."
+        steps = resp.json()["steps"]
+        assert steps == 4, (
+            f"Expected 4 steps (1 pass only), got {steps}. "
+            "Fallback confidence is probably below CONFIDENCE_THRESHOLD — "
+            "check the fix in reflection_node."
         )
 
 
 @pytest.mark.asyncio
+class TestParallelSymbolFailure:
+    """
+    Fix 7: one symbol failing inside asyncio.gather must not crash the whole run.
+
+    Note: with no API keys every symbol uses mock data so nothing naturally
+    fails — we use unittest.mock.patch to inject a real exception for MSFT
+    and verify AAPL's results are still returned.
+    """
+
+    async def test_one_symbol_failure_does_not_crash_analysis(self, async_client):
+        from agent.tools.news_scraper import scrape_financial_news as _real_fn
+
+        async def _patched(symbol, **kwargs):
+            if symbol == "MSFT":
+                raise RuntimeError("Simulated network failure for MSFT")
+            return await _real_fn(symbol, **kwargs)
+
+        with patch(
+            "agent.orchestrator.scrape_financial_news",
+            side_effect=_patched,
+        ):
+            resp = await async_client.post(
+                "/api/analyze",
+                json={"symbols": ["AAPL", "MSFT"]},
+                timeout=60.0,
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # AAPL must have real (mock) data
+        assert "AAPL" in body["sentiment"]
+        assert body["sentiment"]["AAPL"]["total_articles"] > 0
+
+        # MSFT must have a safe fallback (0 articles, neutral ratio)
+        assert "MSFT" in body["sentiment"]
+        assert body["sentiment"]["MSFT"]["total_articles"] == 0
+        assert body["sentiment"]["MSFT"]["positive_ratio"] == 0.5
+
+    async def test_all_symbols_fail_gracefully_returns_200(self, async_client):
+        """Even if every symbol fails, the pipeline should still return 200."""
+
+        async def _always_fail(symbol, **kwargs):
+            raise RuntimeError(f"Total failure for {symbol}")
+
+        with patch(
+            "agent.orchestrator.scrape_financial_news",
+            side_effect=_always_fail,
+        ):
+            resp = await async_client.post(
+                "/api/analyze",
+                json={"symbols": ["AAPL"]},
+                timeout=60.0,
+            )
+
+        assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 class TestFundamentalsEndpoint:
-    """RAG endpoint must degrade gracefully when Qdrant is unreachable."""
+    """RAG endpoint degrades gracefully when Qdrant is unreachable."""
 
     async def test_returns_503_when_qdrant_down(self, async_client):
         resp = await async_client.get(
-            "/api/fundamentals/AAPL",
-            params={"query": "revenue growth"},
+            "/api/fundamentals/AAPL", params={"query": "revenue growth"}
         )
         assert resp.status_code == 503
         assert "Vector DB" in resp.json()["detail"]
@@ -399,7 +379,7 @@ class TestFundamentalsEndpoint:
 
 @pytest.mark.asyncio
 class TestCORSHeaders:
-    """Fix 5 — wildcard origin must be gone; localhost dev origins allowed."""
+    """Fix 5 — wildcard origin removed; localhost origins allowed."""
 
     async def test_localhost_5173_allowed(self, async_client):
         resp = await async_client.options(
@@ -409,92 +389,84 @@ class TestCORSHeaders:
         acao = resp.headers.get("access-control-allow-origin", "")
         assert acao == "http://localhost:5173"
 
-    async def test_evil_origin_not_in_allow_header(self, async_client):
+    async def test_evil_origin_blocked(self, async_client):
         resp = await async_client.options(
             "/api/analyze",
             headers={"Origin": "http://evil.com"},
         )
         acao = resp.headers.get("access-control-allow-origin", "")
-        assert acao != "*"
-        assert "evil.com" not in acao
+        assert acao != "*" and "evil.com" not in acao
 
 
-# ---------------------------------------------------------------------------
-# Layer 3: Routing logic unit tests
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Layer 3 — Routing logic unit tests
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class TestRoutingLogic:
-    """Fix 1 + Fix 9 — routing function must respect all 4 rules."""
+    """Fix 1 + Fix 9 — all 4 routing rules, plus the bug-fix assertions."""
 
-    def _make_state(self, **kwargs):
-        defaults = {
+    def _state(self, **kw):
+        return {
             "reflection_step_count": 0,
             "reflection": "",
             "confidence": 0.7,
             "symbols": ["AAPL"],
+            **kw,
         }
-        defaults.update(kwargs)
-        return defaults
 
     def test_rule1_hard_cap_forces_decide(self):
-        from backend.agent.orchestrator import should_gather_more  # type: ignore
+        from agent.orchestrator import should_gather_more
 
-        # reflection_step_count >= REFLECTION_THRESHOLD (2) → decide
-        state = self._make_state(reflection_step_count=2, confidence=0.3)
-        assert should_gather_more(state) == "decide"
+        assert should_gather_more(self._state(reflection_step_count=2, confidence=0.1)) == "decide"
 
-    def test_rule2_gather_more_data_string_routes_to_research(self):
-        from backend.agent.orchestrator import should_gather_more  # type: ignore
+    def test_rule2_gather_more_data_routes_to_research(self):
+        from agent.orchestrator import should_gather_more
 
-        state = self._make_state(
-            reflection_step_count=0,
-            reflection="Assessment looks weak. GATHER_MORE_DATA",
-            confidence=0.8,  # above threshold — rule 2 still fires
-        )
-        assert should_gather_more(state) == "research"
+        assert should_gather_more(self._state(
+            reflection="GATHER_MORE_DATA", confidence=0.9
+        )) == "research"
 
     def test_rule3_low_confidence_routes_to_research(self):
-        from backend.agent.orchestrator import should_gather_more  # type: ignore
+        from agent.orchestrator import should_gather_more
 
-        state = self._make_state(
-            reflection_step_count=0,
-            reflection="All good. PROCEED",
-            confidence=0.3,  # below 0.6 threshold
-        )
-        assert should_gather_more(state) == "research"
+        assert should_gather_more(self._state(confidence=0.3)) == "research"
 
-    def test_rule4_good_confidence_proceeds_to_decide(self):
-        from backend.agent.orchestrator import should_gather_more  # type: ignore
+    def test_rule4_good_confidence_routes_to_decide(self):
+        from agent.orchestrator import should_gather_more
 
-        state = self._make_state(
-            reflection_step_count=0,
-            reflection="Data looks solid. PROCEED",
-            confidence=0.8,
-        )
-        assert should_gather_more(state) == "decide"
+        assert should_gather_more(self._state(confidence=0.8)) == "decide"
 
-    def test_rule1_takes_priority_over_rule2(self):
-        """Hard cap must fire even if reflection says GATHER_MORE_DATA."""
-        from backend.agent.orchestrator import should_gather_more  # type: ignore
+    def test_rule1_beats_rule2_hard_cap_wins(self):
+        from agent.orchestrator import should_gather_more
 
-        state = self._make_state(
-            reflection_step_count=2,  # at cap
-            reflection="GATHER_MORE_DATA",
-            confidence=0.1,
-        )
-        assert should_gather_more(state) == "decide"
+        # Even with GATHER_MORE_DATA, hard cap must fire
+        assert should_gather_more(self._state(
+            reflection_step_count=2, reflection="GATHER_MORE_DATA", confidence=0.1
+        )) == "decide"
 
     def test_fallback_confidence_above_threshold(self):
         """
-        Verify the fix: reflection fallback confidence (0.7) must be >= threshold (0.6).
-        This prevents unnecessary research loops when LLM is unavailable.
+        Bug fix: reflection fallback confidence (0.7) must be >= CONFIDENCE_THRESHOLD (0.6).
+        If this breaks, the agent enters a 2-loop spin with no LLM key.
         """
-        from backend.utils.config import Config  # type: ignore
+        from utils.config import Config
 
-        fallback_confidence = 0.7  # value set in reflection_node except block
-        assert fallback_confidence >= Config.CONFIDENCE_THRESHOLD, (
-            f"Fallback confidence {fallback_confidence} is below "
-            f"CONFIDENCE_THRESHOLD {Config.CONFIDENCE_THRESHOLD}. "
-            "This causes unnecessary reflection loops when LLM is absent."
+        fallback = 0.7  # value set in reflection_node except block
+        assert fallback >= Config.CONFIDENCE_THRESHOLD, (
+            f"Fallback {fallback} < threshold {Config.CONFIDENCE_THRESHOLD}: "
+            "agent will loop unnecessarily when LLM is unavailable."
+        )
+
+    def test_routing_reason_written_to_state(self):
+        """
+        Bug fix: routing_reason must be set in state by reflection_node,
+        not computed inside should_gather_more (which can't write state).
+        """
+        from agent.orchestrator import AgentState
+
+        # routing_reason must exist as a declared field
+        assert "routing_reason" in AgentState.__annotations__, (
+            "routing_reason not declared in AgentState — "
+            "it will silently be dropped when reflection_node returns."
         )

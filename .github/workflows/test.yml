@@ -1,0 +1,59 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    name: Zero-key fallback suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install uv — faster than pip for a project this size
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true   # caches ~/.cache/uv across runs
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # uv reads uv.lock; --frozen means "never re-resolve, fail if lock is stale"
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      # Run every test with zero API keys.
+      # conftest.py blanks all env vars before importing the app,
+      # so no secrets are needed in GitHub repo settings.
+      - name: Run fallback test suite
+        run: uv run pytest tests/test_fallbacks.py -v --tb=short
+        env:
+          # Explicitly ensure no keys leak in from the runner environment
+          GEMINI_API_KEY: ""
+          NEWS_API_KEY: ""
+          QDRANT_URL: "http://localhost:9999"
+          UPSTASH_REDIS_URL: ""
+          LANGFUSE_PUBLIC_KEY: ""
+          LANGFUSE_SECRET_KEY: ""
+          OBSERVABILITY_ENABLED: "false"
+
+      # Upload the pytest XML report as a CI artifact (visible in Actions tab)
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+        continue-on-error: true
