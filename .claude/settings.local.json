@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"open\\(''README.md'', encoding=''utf-8''\\).read\\(\\); print\\(''UTF-8 OK''\\)\")"
+    ]
+  }
+}
