@@ -34,6 +34,11 @@ dependencies = [
     "langchain-mcp-adapters>=0.1.8",
     "mcp>=1.0.0",
     "langfuse>=2.0.0",
+    "pandas-ta>=0.3.14b ; python_version >= '3.12'",
+    "quantstats>=0.0.62",
+    "pyportfolioopt>=1.5.5",
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
 ]
 
 # ---------------------------------------------------------------------------

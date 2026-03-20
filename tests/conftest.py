@@ -37,6 +37,7 @@ _EMPTY_KEYS = {
     "OBSERVABILITY_ENABLED": "false",
     "CONFIDENCE_THRESHOLD": "0.6",
     "REFLECTION_THRESHOLD": "2",
+    "MULTI_AGENT_MODE": "true",
 }
 
 for _k, _v in _EMPTY_KEYS.items():

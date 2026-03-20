@@ -53,3 +53,6 @@ class Config:
     LANGFUSE_SECRET_KEY: Optional[str] = os.getenv("LANGFUSE_SECRET_KEY")
     LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
     OBSERVABILITY_ENABLED: bool = os.getenv("OBSERVABILITY_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    # Phase 3 — multi-agent mode
+    MULTI_AGENT_MODE: bool = os.getenv("MULTI_AGENT_MODE", "true").lower() in ("true", "1", "yes")

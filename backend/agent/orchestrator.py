@@ -1,18 +1,18 @@
 """
 LangGraph Agent Orchestrator for FinAgent.
 
-Workflow:
+Phase 1-2 (single agent):
   START → research → backtest → reflect ─┬─► decide → END
                                           └─► research (max loops)
 
-Each node is a pure function that receives the full AgentState
-and returns a partial update dict.
+Phase 3 (multi-agent):
+  START → director_init → run_specialists → run_synthesis → format_report → END
 
-Phase 2 additions:
-  Fix 7  – parallel symbol processing via asyncio.gather
-  Fix 8  – MCP server integration (optional, fallback to direct calls)
-  Fix 9  – CONFIDENCE_THRESHOLD / REFLECTION_THRESHOLD wired into routing
-  Fix 10 – @traceable decorators for Langfuse per-node observability
+The multi-agent graph runs 3 specialist agents in parallel (SEC, Technical,
+Risk), then synthesises results. Config.MULTI_AGENT_MODE selects which graph.
+
+Each node is a pure function that receives the full state and returns a
+partial update dict.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ class ReflectionOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Agent State
+# Agent State (single-agent, Phase 1-2)
 # ---------------------------------------------------------------------------
 
 
@@ -286,9 +286,9 @@ async def _backtest_single_symbol(
     return {"symbol": symbol, "result": result}
 
 
-# ---------------------------------------------------------------------------
-# Node functions
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# SINGLE-AGENT GRAPH (Phase 1-2 fallback)
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 @traceable(name="research_node")
@@ -381,9 +381,6 @@ async def backtest_node(state: AgentState) -> Dict:
 async def reflection_node(state: AgentState) -> Dict:
     """
     Node 3 – Reflect: LLM evaluates research + backtest quality.
-
-    Uses structured output (ReflectionOutput) for reliable parsing.
-    Sets confidence from the LLM's self-assessment (Fix 9).
     """
     logger.info("[reflection_node] Reflecting on research and backtest results")
 
@@ -431,8 +428,6 @@ the agent loops back for more research (threshold: {Config.CONFIDENCE_THRESHOLD}
         reflection_text = (
             "Reflection unavailable. Proceeding with available data. PROCEED"
         )
-        # Set above CONFIDENCE_THRESHOLD so the routing function proceeds
-        # to decide immediately — don't waste cycles looping with no LLM.
         confidence = 0.7
 
     # Pre-compute why routing will fire so it ends up in state
@@ -532,11 +527,12 @@ rate the quality of the data you had available."""
 
 
 # ---------------------------------------------------------------------------
-# Build the LangGraph
+# Build the single-agent LangGraph (Phase 1-2)
 # ---------------------------------------------------------------------------
 
 
-def build_agent():
+def build_single_agent_graph():
+    """Original 4-node graph — used as fallback when MULTI_AGENT_MODE=false."""
     workflow = StateGraph(AgentState)
 
     workflow.add_node("research", research_node)
@@ -558,6 +554,302 @@ def build_agent():
     workflow.add_edge("decide", END)
 
     return workflow.compile()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-AGENT GRAPH (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+from agent.specialist_agents.shared_state import (
+    FinalRecommendation,
+    FundamentalAnalysis,
+    MultiAgentState,
+    RiskAnalysis,
+    TechnicalAnalysis,
+)
+
+
+@traceable(name="director_init")
+async def director_init_node(state: MultiAgentState) -> Dict:
+    """
+    Research Director: validate symbols, fetch news + sentiment in parallel.
+    Reuses the Phase 2 parallel news pipeline.
+    """
+    symbols = state.get("symbols", ["AAPL"])
+    logger.info(f"[director_init] Starting multi-agent analysis for {symbols}")
+    t0 = time.perf_counter()
+
+    # Parallel news + sentiment fetch (reuse Phase 2 pattern)
+    tasks = [_process_single_symbol(s) for s in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_news: Dict = {}
+    all_sentiment: Dict = {}
+
+    for i, res in enumerate(results):
+        sym = symbols[i]
+        if isinstance(res, Exception):
+            logger.error(f"[director_init] {sym} failed: {res}")
+            all_news[sym] = {"symbol": sym, "articles": [], "error": str(res)}
+            all_sentiment[sym] = {"positive_ratio": 0.5, "total_articles": 0}
+        else:
+            all_news[sym] = res["news"]
+            all_sentiment[sym] = res["sentiment"]
+
+    elapsed = (time.perf_counter() - t0) * 1000
+    logger.info(f"[director_init] News fetched in {elapsed:.0f}ms")
+
+    return {
+        "news_data": all_news,
+        "sentiment": all_sentiment,
+        "step": 1,
+        "latency_ms": {"director_init": round(elapsed, 1)},
+    }
+
+
+@traceable(name="run_specialists")
+async def run_specialists_node(state: MultiAgentState) -> Dict:
+    """
+    Run SEC, Technical, and Risk agents ALL IN PARALLEL.
+    """
+    from agent.specialist_agents.sec_agent import run_sec_agent
+    from agent.specialist_agents.technical_agent import run_technical_agent
+    from agent.specialist_agents.risk_agent import run_risk_agent
+
+    symbols = state.get("symbols", ["AAPL"])
+    logger.info(f"[run_specialists] Launching 3 agents in parallel for {symbols}")
+    t0 = time.perf_counter()
+
+    t_sec = time.perf_counter()
+    t_tech = time.perf_counter()
+    t_risk = time.perf_counter()
+
+    # All three specialist agents run concurrently
+    fundamental_results, technical_results, risk_results = await asyncio.gather(
+        run_sec_agent(symbols),
+        run_technical_agent(symbols),
+        run_risk_agent(symbols),
+    )
+
+    elapsed = (time.perf_counter() - t0) * 1000
+    logger.info(f"[run_specialists] All 3 agents completed in {elapsed:.0f}ms")
+
+    # Merge latency
+    existing_latency = state.get("latency_ms", {})
+    existing_latency["run_specialists"] = round(elapsed, 1)
+
+    return {
+        "fundamental_analyses": fundamental_results,
+        "technical_analyses": technical_results,
+        "risk_analyses": risk_results,
+        "step": state.get("step", 0) + 1,
+        "latency_ms": existing_latency,
+    }
+
+
+@traceable(name="run_synthesis")
+async def run_synthesis_node(state: MultiAgentState) -> Dict:
+    """
+    For each symbol: match analyses and run synthesis agent.
+    Synthesis runs in parallel across symbols.
+    """
+    from agent.specialist_agents.synthesis_agent import run_synthesis_agent
+
+    symbols = state.get("symbols", ["AAPL"])
+    logger.info(f"[run_synthesis] Synthesising results for {symbols}")
+    t0 = time.perf_counter()
+
+    # Build lookup maps
+    fund_map: Dict[str, FundamentalAnalysis] = {}
+    for fa in state.get("fundamental_analyses", []):
+        fund_map[fa.symbol] = fa
+
+    tech_map: Dict[str, TechnicalAnalysis] = {}
+    for ta in state.get("technical_analyses", []):
+        tech_map[ta.symbol] = ta
+
+    risk_map: Dict[str, RiskAnalysis] = {}
+    for ra in state.get("risk_analyses", []):
+        risk_map[ra.symbol] = ra
+
+    # Build synthesis tasks
+    tasks = []
+    for sym in symbols:
+        fund = fund_map.get(sym, FundamentalAnalysis(symbol=sym))
+        tech = tech_map.get(sym, TechnicalAnalysis(symbol=sym))
+        risk = risk_map.get(sym, RiskAnalysis(symbol=sym))
+
+        # Compute sentiment score from Phase 2 data (-1 to +1)
+        sent_data = state.get("sentiment", {}).get(sym, {})
+        pos_ratio = sent_data.get("positive_ratio", 0.5)
+        sentiment_score = (pos_ratio - 0.5) * 2  # map [0,1] → [-1,+1]
+
+        # Top 3 news headlines
+        news_data = state.get("news_data", {}).get(sym, {})
+        headlines = [a.get("title", "") for a in news_data.get("articles", [])[:3]]
+
+        tasks.append(run_synthesis_agent(
+            symbol=sym,
+            fundamental=fund,
+            technical=tech,
+            risk=risk,
+            sentiment_score=sentiment_score,
+            news_headlines=headlines,
+        ))
+
+    recommendations = await asyncio.gather(*tasks, return_exceptions=True)
+
+    final_recs: List[FinalRecommendation] = []
+    for i, rec in enumerate(recommendations):
+        sym = symbols[i]
+        if isinstance(rec, Exception):
+            logger.error(f"[run_synthesis] {sym} synthesis failed: {rec}")
+            final_recs.append(FinalRecommendation(
+                symbol=sym,
+                action="HOLD",
+                confidence=0.3,
+                thesis=f"Synthesis failed for {sym}.",
+                key_risks=["Synthesis error"],
+            ))
+        else:
+            final_recs.append(rec)
+
+    elapsed = (time.perf_counter() - t0) * 1000
+    logger.info(f"[run_synthesis] Completed in {elapsed:.0f}ms")
+
+    existing_latency = state.get("latency_ms", {})
+    existing_latency["run_synthesis"] = round(elapsed, 1)
+
+    return {
+        "recommendations": final_recs,
+        "step": state.get("step", 0) + 1,
+        "latency_ms": existing_latency,
+    }
+
+
+@traceable(name="format_report")
+async def format_report_node(state: MultiAgentState) -> Dict:
+    """
+    Convert FinalRecommendation list into the AnalyzeResponse-compatible
+    format so the REST API response schema does NOT change.
+    """
+    recommendations = state.get("recommendations", [])
+    symbols = state.get("symbols", ["AAPL"])
+
+    # Map STRONG_BUY/STRONG_SELL → BUY/SELL for backward compat
+    _action_map = {
+        "STRONG_BUY": "BUY",
+        "BUY": "BUY",
+        "HOLD": "HOLD",
+        "SELL": "SELL",
+        "STRONG_SELL": "SELL",
+    }
+
+    # Build structured_decisions in the Phase 1-2 format
+    structured_decisions = []
+    decision_lines = []
+    total_confidence = 0.0
+
+    for rec in recommendations:
+        compat_action = _action_map.get(rec.action, "HOLD")
+        structured_decisions.append({
+            "symbol": rec.symbol,
+            "action": compat_action,
+            "confidence": rec.confidence,
+            "reasoning": rec.thesis,
+            # Phase 3 extras
+            "full_action": rec.action,
+            "composite_score": rec.composite_score,
+            "time_horizon": rec.time_horizon,
+            "conflicting_signals": [c.model_dump() for c in rec.conflicting_signals],
+            "bull_case": rec.bull_case,
+            "bear_case": rec.bear_case,
+            "key_catalysts": rec.key_catalysts,
+            "key_risks": rec.key_risks,
+            "price_target_6m": rec.price_target_6m,
+        })
+        decision_lines.append(
+            f"{rec.symbol}: {rec.action} (confidence: {int(rec.confidence * 100)}%) - {rec.thesis}"
+        )
+        total_confidence += rec.confidence
+
+    avg_confidence = total_confidence / len(recommendations) if recommendations else 0.5
+
+    # Build backtest_results stub from risk analyses (so existing fields are populated)
+    backtest_results = {}
+    for ra in state.get("risk_analyses", []):
+        backtest_results[ra.symbol] = {
+            "sharpe_ratio": ra.sharpe_ratio,
+            "max_drawdown": ra.max_drawdown_pct,
+            "volatility": ra.volatility_annualized,
+            "beta": ra.beta_vs_spy,
+            "risk_rating": ra.risk_rating,
+            "mock": ra.source == "fallback",
+        }
+
+    # Build final report text
+    report_lines = ["# FinAgent Multi-Agent Analysis Report\n"]
+    for rec in recommendations:
+        report_lines.append(f"## {rec.symbol}: {rec.action}")
+        report_lines.append(f"**Confidence:** {rec.confidence:.0%}")
+        report_lines.append(f"**Thesis:** {rec.thesis}")
+        if rec.conflicting_signals:
+            report_lines.append("**Conflicts:**")
+            for c in rec.conflicting_signals:
+                report_lines.append(f"  - [{c.severity}] {c.description}: {c.resolution}")
+        report_lines.append("")
+
+    return {
+        "decision": "\n".join(decision_lines),
+        "confidence": round(avg_confidence, 3),
+        "structured_decisions": structured_decisions,
+        "backtest_results": backtest_results,
+        "final_report": "\n".join(report_lines),
+        "reflection": "Multi-agent synthesis complete.",
+        "routing_reason": "Multi-agent mode — no reflection loop.",
+        "step": state.get("step", 0) + 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build the multi-agent LangGraph (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def build_multi_agent_graph():
+    """
+    Research Director supervisor graph:
+      director_init → run_specialists → run_synthesis → format_report → END
+    """
+    workflow = StateGraph(MultiAgentState)
+
+    workflow.add_node("director_init", director_init_node)
+    workflow.add_node("run_specialists", run_specialists_node)
+    workflow.add_node("run_synthesis", run_synthesis_node)
+    workflow.add_node("format_report", format_report_node)
+
+    workflow.add_edge(START, "director_init")
+    workflow.add_edge("director_init", "run_specialists")
+    workflow.add_edge("run_specialists", "run_synthesis")
+    workflow.add_edge("run_synthesis", "format_report")
+    workflow.add_edge("format_report", END)
+
+    return workflow.compile()
+
+
+# ---------------------------------------------------------------------------
+# Graph selection based on config
+# ---------------------------------------------------------------------------
+
+
+def build_agent():
+    """Select the appropriate graph based on MULTI_AGENT_MODE config."""
+    if Config.MULTI_AGENT_MODE:
+        logger.info("Building multi-agent graph (Phase 3).")
+        return build_multi_agent_graph()
+    else:
+        logger.info("Building single-agent graph (Phase 1-2 fallback).")
+        return build_single_agent_graph()
 
 
 # Singleton agent instance

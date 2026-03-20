@@ -21,8 +21,9 @@ Run:
 
 from __future__ import annotations
 
+import time
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -472,3 +473,237 @@ class TestRoutingLogic:
             "routing_reason not declared in AgentState — "
             "it will silently be dropped when reflection_node returns."
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Layer 4 — Phase 3 multi-agent tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSharedStateModels:
+    """Step 11: Verify all Pydantic models instantiate with defaults."""
+
+    def test_fundamental_analysis_defaults(self):
+        from agent.specialist_agents.shared_state import FundamentalAnalysis
+
+        fa = FundamentalAnalysis(symbol="AAPL")
+        assert fa.source == "fallback"
+        assert fa.data_quality == "low"
+        assert fa.revenue_growth_yoy is None
+
+    def test_technical_analysis_defaults(self):
+        from agent.specialist_agents.shared_state import TechnicalAnalysis
+
+        ta = TechnicalAnalysis(symbol="AAPL")
+        assert ta.trend == "SIDEWAYS"
+        assert ta.rsi_14 == 50.0
+        assert ta.momentum_score == 0.0
+
+    def test_risk_analysis_defaults(self):
+        from agent.specialist_agents.shared_state import RiskAnalysis
+
+        ra = RiskAnalysis(symbol="AAPL")
+        assert ra.risk_rating == "MEDIUM"
+        assert ra.position_size_pct == 5.0
+
+    def test_final_recommendation_defaults(self):
+        from agent.specialist_agents.shared_state import FinalRecommendation
+
+        fr = FinalRecommendation(symbol="AAPL")
+        assert fr.action == "HOLD"
+        assert fr.confidence == 0.5
+
+    def test_multi_agent_state_has_required_fields(self):
+        from agent.specialist_agents.shared_state import MultiAgentState
+
+        required = {
+            "symbols", "fundamental_analyses", "technical_analyses",
+            "risk_analyses", "sentiment", "recommendations",
+            "decision", "step", "structured_decisions", "backtest_results",
+        }
+        assert required.issubset(MultiAgentState.__annotations__.keys())
+
+
+class TestMultiAgentFallbacks:
+    """Step 12-14: Each specialist agent handles failures gracefully."""
+
+    @pytest.mark.asyncio
+    async def test_sec_agent_no_edgartools(self):
+        """Mock ImportError for edgartools → returns FundamentalAnalysis with source='fallback'."""
+        from agent.specialist_agents.sec_agent import run_sec_agent
+
+        with patch(
+            "agent.specialist_agents.sec_agent._fetch_10k_sync",
+            return_value={"business": "", "risks": "", "facts": None},
+        ):
+            results = await run_sec_agent(["AAPL"])
+
+        assert len(results) == 1
+        assert results[0].symbol == "AAPL"
+        assert results[0].source == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_sec_agent_no_llm(self):
+        """LLM unavailable → returns fallback FundamentalAnalysis with data from filing."""
+        from agent.specialist_agents.sec_agent import run_sec_agent
+
+        with patch(
+            "agent.specialist_agents.sec_agent._fetch_10k_sync",
+            return_value={
+                "business": "Apple Inc. designs consumer electronics.",
+                "risks": "Competition is intense. Supply chain risks exist. Regulatory changes possible.",
+                "facts": None,
+            },
+        ), patch("agent.specialist_agents.sec_agent._sec_llm", None):
+            results = await run_sec_agent(["AAPL"])
+
+        assert len(results) == 1
+        assert results[0].symbol == "AAPL"
+        # Should have extracted risk lines from the text
+        assert results[0].source in ("edgar_live", "fallback")
+
+    @pytest.mark.asyncio
+    async def test_technical_agent_insufficient_data(self):
+        """< 60 rows → returns fallback TechnicalAnalysis."""
+        from agent.specialist_agents.technical_agent import run_technical_agent
+
+        # Mock yfinance returning only 30 rows
+        with patch(
+            "agent.specialist_agents.technical_agent._fetch_ohlcv_sync",
+            return_value=None,
+        ):
+            results = await run_technical_agent(["AAPL"])
+
+        assert len(results) == 1
+        assert results[0].symbol == "AAPL"
+        assert results[0].source == "fallback"
+        assert results[0].data_points == 0
+
+    @pytest.mark.asyncio
+    async def test_risk_agent_no_spy_data(self):
+        """SPY fetch fails → returns fallback RiskAnalysis."""
+        from agent.specialist_agents.risk_agent import run_risk_agent
+
+        with patch(
+            "agent.specialist_agents.risk_agent._fetch_returns_sync",
+            return_value=None,
+        ):
+            results = await run_risk_agent(["AAPL"])
+
+        assert len(results) == 1
+        assert results[0].symbol == "AAPL"
+        assert results[0].source == "fallback"
+        assert results[0].risk_rating == "MEDIUM"
+
+    @pytest.mark.asyncio
+    async def test_synthesis_agent_no_llm(self):
+        """LLM fails → returns computed scores with fallback text."""
+        from agent.specialist_agents.synthesis_agent import run_synthesis_agent
+        from agent.specialist_agents.shared_state import (
+            FundamentalAnalysis, TechnicalAnalysis, RiskAnalysis,
+        )
+
+        with patch("agent.specialist_agents.synthesis_agent._synthesis_llm", None):
+            result = await run_synthesis_agent(
+                symbol="AAPL",
+                fundamental=FundamentalAnalysis(symbol="AAPL"),
+                technical=TechnicalAnalysis(symbol="AAPL"),
+                risk=RiskAnalysis(symbol="AAPL"),
+                sentiment_score=0.3,
+                news_headlines=["Test headline"],
+            )
+
+        assert result.symbol == "AAPL"
+        assert result.action in ("STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL")
+        assert -1.0 <= result.composite_score <= 1.0
+        assert 0.0 < result.confidence <= 1.0
+
+    def test_conflict_detection_all_four(self):
+        """Set up state triggering all 4 conflicts → assert 4 SignalConflict objects."""
+        from agent.specialist_agents.synthesis_agent import _detect_conflicts
+        from agent.specialist_agents.shared_state import (
+            FundamentalAnalysis, TechnicalAnalysis, RiskAnalysis,
+        )
+
+        # Construct inputs that trigger all 4 conflict detectors:
+        # A: tech bullish (momentum > 0.2) + sentiment bearish (< -0.3)
+        # B: UPTREND + HIGH risk
+        # C: PE > 40 + momentum > 0.3
+        # D: both fundamental and technical source = "fallback"
+        conflicts = _detect_conflicts(
+            sentiment_score=-0.5,  # bearish → triggers A
+            technical=TechnicalAnalysis(
+                symbol="TEST",
+                trend="UPTREND",              # triggers B
+                momentum_score=0.5,           # triggers A and C
+                source="fallback",            # triggers D
+            ),
+            fundamental=FundamentalAnalysis(
+                symbol="TEST",
+                pe_ratio=50.0,                # triggers C
+                source="fallback",            # triggers D
+            ),
+            risk=RiskAnalysis(
+                symbol="TEST",
+                risk_rating="HIGH",           # triggers B
+            ),
+        )
+
+        assert len(conflicts) == 4, f"Expected 4 conflicts, got {len(conflicts)}: {[c.description for c in conflicts]}"
+        severities = {c.severity for c in conflicts}
+        assert "HIGH" in severities
+        assert "MEDIUM" in severities
+        assert "LOW" in severities
+
+
+@pytest.mark.asyncio
+class TestResearchDirector:
+    """Step 15: Full multi-agent pipeline integration tests."""
+
+    async def test_multi_agent_zero_keys(self, async_client):
+        """POST /api/analyze with MULTI_AGENT_MODE=true, all keys blank → 200."""
+        resp = await async_client.post(
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=120.0,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "success"
+        # Response must have same schema as before
+        required = {
+            "status", "symbols", "decision", "confidence", "sentiment",
+            "backtest_results", "reflection", "steps", "timestamp",
+            "structured_decisions", "latency_ms",
+        }
+        assert required.issubset(body.keys())
+
+    async def test_multi_agent_structured_decisions_have_extras(self, async_client):
+        """Multi-agent decisions include Phase 3 fields like composite_score."""
+        resp = await async_client.post(
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=120.0,
+        )
+        body = resp.json()
+        assert resp.status_code == 200
+        decisions = body["structured_decisions"]
+        assert len(decisions) >= 1
+        d = decisions[0]
+        assert "composite_score" in d
+        assert "time_horizon" in d
+        assert "conflicting_signals" in d
+
+    async def test_multi_agent_confidence_valid(self, async_client):
+        """Confidence is a valid float between 0 and 1."""
+        resp = await async_client.post(
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=120.0,
+        )
+        assert 0.0 <= resp.json()["confidence"] <= 1.0
+
+    async def test_parallel_specialist_timing(self, async_client):
+        """run_specialists node completes in < 30s with mocked data."""
+        t0 = time.perf_counter()
+        resp = await async_client.post(
+            "/api/analyze", json={"symbols": ["AAPL"]}, timeout=120.0,
+        )
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 200
+        # With all mocked data, the pipeline should complete well under 30s
+        assert elapsed < 30, f"Pipeline took {elapsed:.1f}s — expected < 30s"

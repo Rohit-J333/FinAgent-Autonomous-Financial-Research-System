@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from agent.orchestrator import AgentState, agent
+from agent.specialist_agents.shared_state import MultiAgentState
 from rag.retriever import FinancialRetriever
 from rag.vectordb import FinancialVectorDB
 from utils.config import Config
@@ -148,8 +149,31 @@ class AnalyzeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _initial_state(symbols: List[str]) -> AgentState:
-    """Build a clean AgentState for a new analysis run."""
+def _initial_state(symbols: List[str]):
+    """Build a clean initial state for a new analysis run.
+
+    Returns the appropriate state type based on MULTI_AGENT_MODE.
+    """
+    if Config.MULTI_AGENT_MODE:
+        return {
+            "symbols": symbols,
+            "mode": "multi_agent",
+            "fundamental_analyses": [],
+            "technical_analyses": [],
+            "risk_analyses": [],
+            "sentiment": {},
+            "news_data": {},
+            "recommendations": [],
+            "final_report": "",
+            "routing_reason": "",
+            "reflection_step_count": 0,
+            "confidence": 0.0,
+            "latency_ms": {},
+            "decision": "",
+            "step": 0,
+            "structured_decisions": [],
+            "backtest_results": {},
+        }
     return {
         "messages": [],
         "symbols": symbols,
@@ -212,15 +236,18 @@ async def analyze_markets(request: AnalyzeRequest):
 
         logger.info(f"Analysis complete in {latency_ms:.0f}ms for {symbols}")
 
+        # Multi-agent uses "sentiment", single-agent uses "sentiment_scores"
+        sentiment_data = final_state.get("sentiment") or final_state.get("sentiment_scores", {})
+
         response = AnalyzeResponse(
             status="success",
             symbols=symbols,
-            decision=final_state["decision"],
+            decision=final_state.get("decision", ""),
             confidence=final_state.get("confidence", 0.0),
-            sentiment=final_state["sentiment_scores"],
-            backtest_results=final_state["backtest_results"],
-            reflection=final_state["reflection"],
-            steps=final_state["step"],
+            sentiment=sentiment_data,
+            backtest_results=final_state.get("backtest_results", {}),
+            reflection=final_state.get("reflection", ""),
+            steps=final_state.get("step", 0),
             timestamp=datetime.utcnow().isoformat(),
             structured_decisions=final_state.get("structured_decisions", []),
             latency_ms=round(latency_ms, 1),
