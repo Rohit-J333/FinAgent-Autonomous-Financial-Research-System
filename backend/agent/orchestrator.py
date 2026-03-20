@@ -107,16 +107,25 @@ class AgentState(TypedDict):
 # LLM
 # ---------------------------------------------------------------------------
 
-llm = ChatGoogleGenerativeAI(
-    model=Config.GEMINI_MODEL,
-    google_api_key=Config.GEMINI_API_KEY,
-    temperature=0.3,
-    convert_system_message_to_human=True,
-)
-
-# Structured-output wrappers
-decision_llm = llm.with_structured_output(DecisionOutput)
-reflection_llm = llm.with_structured_output(ReflectionOutput)
+try:
+    llm = ChatGoogleGenerativeAI(
+        model=Config.GEMINI_MODEL,
+        google_api_key=Config.GEMINI_API_KEY,
+        temperature=0.3,
+        convert_system_message_to_human=True,
+    )
+    # Structured-output wrappers
+    decision_llm = llm.with_structured_output(DecisionOutput)
+    reflection_llm = llm.with_structured_output(ReflectionOutput)
+    logger.info("Gemini LLM initialised.")
+except Exception as _llm_init_err:
+    logger.warning(
+        f"Gemini LLM unavailable ({_llm_init_err}). "
+        "All LLM nodes will use fallback responses."
+    )
+    llm = None  # type: ignore[assignment]
+    decision_llm = None  # type: ignore[assignment]
+    reflection_llm = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +419,8 @@ Set confidence_in_current_data between 0.0 and 1.0 — this determines whether
 the agent loops back for more research (threshold: {Config.CONFIDENCE_THRESHOLD})."""
 
     try:
+        if reflection_llm is None:
+            raise RuntimeError("LLM not initialised (no API key)")
         result: ReflectionOutput = await reflection_llm.ainvoke([("user", prompt)])
         reflection_text = result.assessment
         confidence = result.confidence_in_current_data
@@ -481,6 +492,8 @@ rationale (2-3 sentences). Also assess the overall market sentiment and
 rate the quality of the data you had available."""
 
     try:
+        if decision_llm is None:
+            raise RuntimeError("LLM not initialised (no API key)")
         result: DecisionOutput = await decision_llm.ainvoke([("user", prompt)])
 
         structured = [d.model_dump() for d in result.decisions]

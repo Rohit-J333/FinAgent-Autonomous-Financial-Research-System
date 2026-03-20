@@ -217,7 +217,9 @@ class TestSymbolValidation:
             json={"symbols": ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "NVDA", "META"]},
         )
         assert resp.status_code == 422
-        assert any("Maximum 6" in str(e) for e in resp.json()["detail"])
+        # Pydantic v2 fires max_length=6 constraint; message varies by version
+        errors = resp.json()["detail"]
+        assert any("symbols" in str(e.get("loc", "")) for e in errors)
 
     async def test_empty_symbols_returns_422(self, async_client):
         resp = await async_client.post("/api/analyze", json={"symbols": []})
