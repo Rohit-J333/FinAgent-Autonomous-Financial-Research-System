@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"open\\(''README.md'', encoding=''utf-8''\\).read\\(\\); print\\(''UTF-8 OK''\\)\")"
+      "Bash(python -c \"open\\(''README.md'', encoding=''utf-8''\\).read\\(\\); print\\(''UTF-8 OK''\\)\")",
+      "Bash(uv run:*)",
+      "Bash(GEMINI_API_KEY=\"\" NEWS_API_KEY=\"\" UPSTASH_REDIS_URL=\"\" LANGFUSE_PUBLIC_KEY=\"\" LANGFUSE_SECRET_KEY=\"\" OBSERVABILITY_ENABLED=\"false\" QDRANT_URL=\"http://localhost:9999\" uv run python -c \":*)"
     ]
   }
 }
